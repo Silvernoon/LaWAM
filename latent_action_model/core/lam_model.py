@@ -3,7 +3,7 @@ import torch.nn as nn
 import warnings
 from typing import Dict, Optional, Any, Tuple
 from .vq import VQ, NSVQ, EMAVQ, AEQuantizer
-from .vjepa_encoder import build_vision_encoder, CosmosAutoencoder, VJEPAEncoder
+from .vjepa_encoder import build_vision_encoder, CosmosAutoencoder, VJEPAEncoder, WorldStereoVAEEncoder
 
 import yaml
 from latent_action_model.data_loader.video_aug import LAM_IMAGE_HW, LAM_PATCH_SIZE
@@ -50,9 +50,10 @@ class LatentLAMModel(nn.Module):
         super().__init__()
         self.image_hw = (int(image_hw[0]), int(image_hw[1]))
         self.patch_size = int(patch_size)
-        if self.patch_size != LAM_PATCH_SIZE:
+        if self.patch_size not in (8, 16):
             raise ValueError(
-                f"Unsupported patch_size={self.patch_size}. Only {LAM_PATCH_SIZE} is supported."
+                f"Unsupported patch_size={self.patch_size}. Only 8 or 16 are supported "
+                f"(16 for DINO/V-JEPA/Cosmos patch grids, 8 for the WorldStereo WAN VAE)."
             )
         if self.image_hw[0] % self.patch_size != 0 or self.image_hw[1] % self.patch_size != 0:
             raise ValueError(
@@ -90,6 +91,17 @@ class LatentLAMModel(nn.Module):
                 if self.patch_size != int(getattr(self.vision_encoder, "patch_size", self.patch_size)):
                     raise ValueError(
                         "CosmosAutoencoder branch requires LAM patch_size to match the tokenizer spatial compression ratio."
+                    )
+            if isinstance(self.vision_encoder, WorldStereoVAEEncoder):
+                if isinstance(latent_layer_to_use, (list, tuple)):
+                    raise ValueError(
+                        "WorldStereoVAEEncoder branch supports only a single latent_layer_to_use value."
+                    )
+                if self.patch_size != int(getattr(self.vision_encoder, "patch_size", self.patch_size)):
+                    raise ValueError(
+                        "WorldStereoVAEEncoder branch requires LAM patch_size to match the WAN VAE spatial "
+                        f"compression ratio ({int(getattr(self.vision_encoder, 'patch_size', 8))}). "
+                        "Set model.patch_size accordingly (e.g. 8)."
                     )
             encoder_image_size = getattr(self.vision_encoder, "image_size", None)
             if encoder_image_size is not None:

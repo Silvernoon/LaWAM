@@ -78,10 +78,11 @@ class VJEPA_LAM(LightningModule):
         self.patch_size = int(patch_size)
         self.image_aug = image_aug
         self.dual_view_aug = bool(dual_view_aug)
-        if self.patch_size != LAM_PATCH_SIZE:
+        if self.patch_size not in (8, 16):
             raise ValueError(
                 f"Unsupported LAM patch_size={self.patch_size}. "
-                f"Only {LAM_PATCH_SIZE} is supported in this branch."
+                f"Only 8 or 16 are supported in this branch "
+                f"(16 for DINO/V-JEPA/Cosmos patch grids, 8 for the WorldStereo WAN VAE)."
             )
         
         self.lam = LatentLAMModel(

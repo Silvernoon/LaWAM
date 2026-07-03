@@ -599,6 +599,209 @@ class CosmosAutoencoder(nn.Module):
             raise RuntimeError("The current Cosmos weight directory is missing model files required for autoencode.")
         return self.decoder_model(self.encoder_model(imgs11)).clamp(-1.0, 1.0)
 
+
+class WorldStereoVAEEncoder(nn.Module):
+    """Wrap WorldStereo's keyframe WAN VAE (`AutoencoderKLWan`) as an image-sequence
+    feature encoder returning [B, T, K, D].
+
+    WorldStereo (CVPR 2026) encodes each frame independently in a "keyframe latent
+    space" via a WAN 3D-VAE. We reuse only that frozen VAE encoder as a drop-in
+    visual tokenizer for the LAM, analogous to the Cosmos tokenizer path. The WAN
+    VAE downsamples space by 8 and produces `z_dim` latent channels per frame, so a
+    256x256 input yields a 32x32 grid (=1024 tokens) of D=z_dim features. This
+    requires the LAM to run with patch_size=8 so the token grid stays aligned.
+
+    `model_id` is parsed as `worldstereo:<base_model>` (or just a path/repo id
+    containing "worldstereo"/"wan"), where `<base_model>` is the diffusers repo or
+    local directory that owns the `vae` subfolder (e.g. a WAN base model). Only
+    `diffusers` is required at runtime; the heavier WorldStereo deps (pytorch3d,
+    MoGe, the DiT/ControlNet stack) are never imported.
+    """
+
+    def __init__(
+        self,
+        model_id: str = "worldstereo:Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        dtype: str = "bfloat16",
+        norm_layer_type: str = "l2",
+        enable_norm: bool = False,
+    ):
+        super().__init__()
+        from diffusers.models import AutoencoderKLWan
+
+        self.device = torch.device("cpu")
+        self.model_id = str(model_id)
+        self.dtype_str = str(dtype)
+        self.norm_layer_type = str(norm_layer_type).lower()
+        self.enable_norm = bool(enable_norm)
+        # WAN VAE spatial compression ratio (input_hw / latent_hw).
+        self.patch_size = 8
+        self.image_size = None
+
+        base_model = self._parse_base_model(self.model_id)
+        load_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}.get(
+            self.dtype_str, torch.float32
+        )
+        local_only = Path(base_model).expanduser().is_dir()
+        vae = AutoencoderKLWan.from_pretrained(
+            base_model, subfolder="vae", torch_dtype=load_dtype, local_files_only=local_only
+        ).eval()
+        for p in vae.parameters():
+            p.requires_grad = False
+        self.vae = vae
+
+        vae_config = vae.config
+        self.feature_dim = int(getattr(vae_config, "z_dim"))
+        # Per-channel latent normalization stats used by WorldStereo's keyframe codec.
+        latents_mean = torch.tensor(vae_config.latents_mean, dtype=torch.float32).view(1, self.feature_dim, 1, 1, 1)
+        latents_std = torch.tensor(vae_config.latents_std, dtype=torch.float32).view(1, self.feature_dim, 1, 1, 1)
+        self.register_buffer("_latents_mean", latents_mean, persistent=False)
+        self.register_buffer("_latents_inv_std", 1.0 / latents_std, persistent=False)
+        self.register_buffer("_runtime_anchor", torch.empty(0), persistent=False)
+        self.register_buffer(
+            "_imagenet_mean",
+            torch.tensor(IMAGENET_DEFAULT_MEAN, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_imagenet_std",
+            torch.tensor(IMAGENET_DEFAULT_STD, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        if self.norm_layer_type in ("bn", "ln"):
+            if self.norm_layer_type == "bn":
+                self.latent_norm = nn.SyncBatchNorm(self.feature_dim, affine=False)
+            else:
+                self.latent_norm = nn.LayerNorm(self.feature_dim, elementwise_affine=False)
+        else:
+            self.latent_norm = None
+
+    @staticmethod
+    def _parse_base_model(model_id: str) -> str:
+        # Accept "worldstereo:<base_model>" and return <base_model>; otherwise pass through.
+        if ":" in model_id:
+            prefix, rest = model_id.split(":", 1)
+            if prefix.lower() in ("worldstereo", "wan", "wanvae") and rest:
+                return rest
+        return model_id
+
+    def train(self, mode: bool = True):
+        # Keep the frozen WAN VAE in eval mode regardless of the LAM's train flag.
+        super().train(False)
+        self.vae.eval()
+        return self
+
+    def _module_param_dtype(self, default: torch.dtype = torch.float32) -> torch.dtype:
+        try:
+            return next(self.vae.parameters()).dtype
+        except StopIteration:
+            return default
+
+    @torch.no_grad()
+    def _denormalize_imagenet_to_unit(self, images: torch.Tensor) -> torch.Tensor:
+        images = images.float() * self._imagenet_std + self._imagenet_mean
+        return images.clamp_(0.0, 1.0)
+
+    @torch.no_grad()
+    def _unit_to_negone_posone(self, images01: torch.Tensor) -> torch.Tensor:
+        return images01.mul(2.0).sub(1.0).clamp(-1.0, 1.0)
+
+    def _apply_latent_norm(self, encoded_features: torch.Tensor, use_norm: bool) -> torch.Tensor:
+        if not use_norm:
+            return encoded_features
+        if self.norm_layer_type == "bn":
+            if self.latent_norm is None:
+                raise ValueError("WorldStereoVAEEncoder has no BN layer initialized; set norm_layer_type to 'bn'.")
+            flat_features = encoded_features.reshape(-1, self.feature_dim)
+            flat_features = self.latent_norm(flat_features)
+            return flat_features.view_as(encoded_features)
+        if self.norm_layer_type == "ln":
+            if self.latent_norm is None:
+                raise ValueError("WorldStereoVAEEncoder has no LN layer initialized; set norm_layer_type to 'ln'.")
+            return self.latent_norm(encoded_features)
+        if self.norm_layer_type == "l2":
+            return F.normalize(encoded_features, p=2, dim=-1)
+        raise ValueError(
+            f"Unsupported norm_layer_type={self.norm_layer_type!r} for WorldStereoVAEEncoder. "
+            "Expected one of: 'l2', 'ln', 'bn'."
+        )
+
+    def _retrieve_latents(self, encoder_output) -> torch.Tensor:
+        # Mirror diffusers' retrieve_latents with the deterministic mode used by
+        # WorldStereo's keyframe_vae_encode (sample_mode="argmax").
+        if hasattr(encoder_output, "latent_dist"):
+            return encoder_output.latent_dist.mode()
+        if hasattr(encoder_output, "latents"):
+            return encoder_output.latents
+        raise AttributeError("Could not access latents of provided WAN VAE encoder_output.")
+
+    @torch.no_grad()
+    def encode(
+        self,
+        images: torch.Tensor,
+        norm_latents: Optional[bool] = None,
+        n: int = -1,
+    ) -> torch.Tensor:
+        if images.dim() != 4:
+            B, T, C, H, W = images.shape
+            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+        else:
+            B, C, H, W = images.shape
+            T = 1
+        images = images.to(device=self._runtime_anchor.device, dtype=torch.float32)
+        images = self._denormalize_imagenet_to_unit(images)
+        vae_dtype = self._module_param_dtype()
+        imgs11 = self._unit_to_negone_posone(images).to(dtype=vae_dtype)
+        # WAN VAE expects 5D video tensors [b, c, f, h, w]; encode each frame as f=1.
+        imgs11 = imgs11.unsqueeze(2)  # [B*T, 3, 1, H, W]
+        token = self._retrieve_latents(self.vae.encode(imgs11))  # [B*T, z_dim, 1, h, w]
+        if not isinstance(token, torch.Tensor) or token.ndim != 5:
+            raise RuntimeError(
+                "WorldStereoVAEEncoder.encode expected a 5D WAN latent, "
+                f"but got {type(token).__name__} with shape {getattr(token, 'shape', None)}"
+            )
+        # Rescale to the WorldStereo keyframe latent distribution.
+        token = token.float()
+        token = (token - self._latents_mean) * self._latents_inv_std
+        bt, latent_channels, latent_f, latent_h, latent_w = token.shape
+        token = token.reshape(B, T, latent_channels, latent_h * latent_w).permute(0, 1, 3, 2).contiguous()
+        use_norm = self.enable_norm if norm_latents is None else bool(norm_latents)
+        token = self._apply_latent_norm(token, use_norm=use_norm)
+        return token.detach()
+
+    @torch.no_grad()
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        if latent.ndim == 4:
+            B, T, num_tokens, channels = latent.shape
+            latent = latent.reshape(B * T, num_tokens, channels)
+            restore_video = True
+        elif latent.ndim == 3:
+            B, num_tokens, channels = latent.shape
+            T = 1
+            restore_video = False
+        else:
+            raise ValueError(f"WorldStereoVAEEncoder.decode expected a 3D/4D latent, got: {tuple(latent.shape)}")
+
+        if channels != self.feature_dim:
+            raise ValueError(
+                f"WorldStereoVAEEncoder.decode expected latent channel count {self.feature_dim}, got: {channels}"
+            )
+        grid_size = int(round(math.sqrt(num_tokens)))
+        if grid_size * grid_size != num_tokens:
+            raise ValueError(
+                f"WorldStereoVAEEncoder.decode only supports square-grid latents, got num_tokens={num_tokens}."
+            )
+
+        vae_dtype = self._module_param_dtype()
+        latent = latent.to(device=self._runtime_anchor.device, dtype=torch.float32)
+        # Undo the keyframe rescale, then reshape back to [b, z_dim, 1, h, w].
+        latent = latent.permute(0, 2, 1).contiguous().reshape(latent.shape[0], channels, grid_size, grid_size)
+        latent = latent.unsqueeze(2)
+        latent = latent / self._latents_inv_std + self._latents_mean
+        decoded = self.vae.decode(latent.to(dtype=vae_dtype), return_dict=False)[0]  # [b, 3, 1, H, W]
+        decoded = decoded.squeeze(2).clamp(-1.0, 1.0)
+        if restore_video:
+            decoded = decoded.reshape(B, T, *decoded.shape[1:])
+        return decoded
  
 
 def build_vision_encoder(
@@ -620,6 +823,13 @@ def build_vision_encoder(
         return encoder, encoder.feature_dim
     elif "vjepa" in key or "jepa" in key or vjepa_hub_name is not None:
         encoder = VJEPAEncoder(
+            model_id=model_id,
+            norm_layer_type=norm_layer_type,
+            enable_norm=enable_norm,
+        )
+        return encoder, encoder.feature_dim
+    elif "worldstereo" in key or "wan" in key:
+        encoder = WorldStereoVAEEncoder(
             model_id=model_id,
             norm_layer_type=norm_layer_type,
             enable_norm=enable_norm,
