@@ -84,6 +84,9 @@ DATASET_NAMED_MIXTURES = {
     "SO101_pick": [
         ("pick_dataset_name", 1.0, "SO101"),
     ],
+    "community_so101_pick_pen": [
+        ("EverNorif/so101-pick-pen", 1.0, "SO101"),
+    ],
 
     "arx_x5": [
         ("arx_x5", 1.0, "arx_x5"),

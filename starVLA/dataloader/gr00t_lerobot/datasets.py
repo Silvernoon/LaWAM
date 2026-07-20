@@ -76,6 +76,113 @@ VIDEO_FRAME_CACHE_SCHEMA_VERSION = 2
 DEFAULT_VIDEO_CACHE_BUILD_WORKERS = 8
 DATASET_STAT_FIELDS = ("mean", "std", "min", "max", "q01", "q99")
 
+LE_ROBOT_STANDARD_STATS_FILENAME = "meta/stats.json"
+
+
+def _ensure_required_quantiles(statistics: dict[str, Any]) -> dict[str, Any]:
+    """Normalize official LeRobot v3 stats to the fields used by GR00T transforms."""
+    normalized = copy.deepcopy(statistics)
+    for original_key in ("observation.state", "action"):
+        field_stats = normalized.get(original_key)
+        if not isinstance(field_stats, dict):
+            continue
+        if "min" in field_stats:
+            field_stats.setdefault("q01", field_stats["min"])
+        if "max" in field_stats:
+            field_stats.setdefault("q99", field_stats["max"])
+    return normalized
+
+
+def _build_standard_lerobot_modality_metadata(
+    info_meta: dict[str, Any],
+    modality_configs: dict[str, Any],
+    *,
+    video_key_overrides: dict[str, str] | None = None,
+) -> LeRobotModalityMetadata:
+    """Build GR00T modality aliases from an official LeRobot v3 info.json."""
+    features = info_meta.get("features", {})
+    if not isinstance(features, dict):
+        raise TypeError("Official LeRobot v3 `meta/info.json` must contain a `features` mapping.")
+
+    metadata: dict[str, Any] = {"state": {}, "action": {}, "video": {}, "annotation": {}}
+    original_vector_keys = {"state": "observation.state", "action": "action"}
+    for modality, original_key in original_vector_keys.items():
+        modality_config = modality_configs.get(modality)
+        configured_keys = list(getattr(modality_config, "modality_keys", []))
+        if not configured_keys:
+            continue
+
+        feature = features.get(original_key)
+        if not isinstance(feature, dict):
+            raise KeyError(
+                f"Official LeRobot v3 dataset is missing `{original_key}` in info.json features."
+            )
+        shape = feature.get("shape", [])
+        if len(shape) != 1:
+            raise ValueError(
+                f"Official LeRobot v3 `{original_key}` must be a flat vector, got shape={shape}."
+            )
+        feature_dim = int(shape[0])
+        feature_names = feature.get("names")
+        if not isinstance(feature_names, list) or len(feature_names) != feature_dim:
+            feature_names = [f"dim_{index}" for index in range(feature_dim)]
+
+        for configured_key in configured_keys:
+            subkey = configured_key.split(".", 1)[1]
+            if subkey not in feature_names:
+                raise KeyError(
+                    f"Configured key `{configured_key}` is absent from `{original_key}` names: "
+                    f"{feature_names}."
+                )
+            feature_index = feature_names.index(subkey)
+            metadata[modality][subkey] = {
+                "start": feature_index,
+                "end": feature_index + 1,
+                "absolute": True,
+                "dtype": str(feature.get("dtype", "float32")),
+                "original_key": original_key,
+            }
+
+    video_features = [
+        key
+        for key, feature in features.items()
+        if isinstance(feature, dict) and feature.get("dtype") == "video"
+    ]
+    video_config = modality_configs.get("video")
+    configured_video_keys = list(getattr(video_config, "modality_keys", []))
+    overrides = dict(video_key_overrides or {})
+    assigned_original_keys: set[str] = set()
+    for index, configured_key in enumerate(configured_video_keys):
+        subkey = configured_key.split(".", 1)[1]
+        original_key = overrides.get(configured_key, overrides.get(subkey))
+        if original_key is None:
+            direct_candidate = f"observation.images.{subkey}"
+            if direct_candidate in video_features:
+                original_key = direct_candidate
+            elif index < len(video_features):
+                original_key = video_features[index]
+        if original_key not in video_features:
+            raise KeyError(
+                f"Cannot map configured video key `{configured_key}` to official LeRobot v3 features "
+                f"{video_features}. Set `datasets.vla_data.standard_video_key_map` explicitly."
+            )
+        if original_key in assigned_original_keys:
+            raise ValueError(
+                f"Official LeRobot v3 video feature `{original_key}` was mapped more than once."
+            )
+        assigned_original_keys.add(original_key)
+        metadata["video"][subkey] = {"original_key": original_key}
+
+    language_config = modality_configs.get("language")
+    for configured_key in list(getattr(language_config, "modality_keys", [])):
+        subkey = configured_key.split(".", 1)[1]
+        metadata["annotation"][subkey] = {"original_key": "task_index"}
+    if not metadata["annotation"]:
+        metadata["annotation"] = None
+
+    return LeRobotModalityMetadata.model_validate(metadata)
+
+
 
 def _is_main_process() -> bool:
     return (not dist.is_initialized()) or dist.get_rank() == 0
@@ -579,14 +686,8 @@ class LeRobotSingleDataset(Dataset):
                             used_keys[modality].add(full_key)
 
         # 1. Modality metadata
-        modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
-        # 1.1. State and action modalities
         simplified_modality_meta: dict[str, dict] = {}
-        with open(modality_meta_path, "r") as f:
-            le_modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
+        le_modality_meta = self._get_lerobot_modality_meta()
         for modality in ["state", "action"]:
             simplified_modality_meta[modality] = {}
             
@@ -664,8 +765,12 @@ class LeRobotSingleDataset(Dataset):
             return (not dist.is_initialized()) or dist.get_rank() == 0
         
         stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
+        standard_stats_path = self.dataset_path / LE_ROBOT_STANDARD_STATS_FILENAME
+        precomputed_stats_path = stats_path
+        if not stats_path.exists() and standard_stats_path.exists():
+            precomputed_stats_path = standard_stats_path
         tmp_path = stats_path.with_suffix(".tmp")
-        
+
         # ---------- all rank try to read ----------
         if self._force_recompute_stats:
             le_statistics = None
@@ -675,12 +780,17 @@ class LeRobotSingleDataset(Dataset):
                     f"{self.dataset_name} and overwriting {stats_path}"
                 )
         else:
-            if stats_path.exists():
+            if precomputed_stats_path.exists():
                 try:
-                    with open(stats_path, "r") as f:
-                        le_statistics = json.load(f)
-                    for stat in le_statistics.values():
-                        DatasetStatisticalValues.model_validate(stat)
+                    with open(precomputed_stats_path, "r") as f:
+                        le_statistics = _ensure_required_quantiles(json.load(f))
+                    required_original_keys = {
+                        meta.original_key
+                        for modality in ("state", "action")
+                        for meta in getattr(le_modality_meta, modality).values()
+                    }
+                    for original_key in required_original_keys:
+                        DatasetStatisticalValues.model_validate(le_statistics[original_key])
                 except Exception as e:
                     print(
                         f"[RANK {os.environ.get('RANK', 'NA')}] "
@@ -699,7 +809,9 @@ class LeRobotSingleDataset(Dataset):
                 pf for pf in parquet_files if "episode_033675.parquet" not in pf.name
             ]
         
-            le_statistics = calculate_dataset_statistics(parquet_files_filtered)
+            le_statistics = _ensure_required_quantiles(
+                calculate_dataset_statistics(parquet_files_filtered)
+            )
         
             stats_path.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp_path, "w") as f:
@@ -725,7 +837,7 @@ class LeRobotSingleDataset(Dataset):
                 state_action_meta = le_modality_meta.get_key_meta(f"{our_modality}.{subkey}")
                 assert isinstance(state_action_meta, LeRobotStateActionMetadata)
                 le_modality = state_action_meta.original_key
-                for stat_name in le_statistics[le_modality]:
+                for stat_name in DATASET_STAT_FIELDS:
                     indices = np.arange(
                         state_action_meta.start,
                         state_action_meta.end,
@@ -1060,14 +1172,28 @@ class LeRobotSingleDataset(Dataset):
         return float(fps_candidates[0])
 
     def _get_lerobot_modality_meta(self) -> LeRobotModalityMetadata:
-        """Get the metadata for the LeRobot dataset."""
+        """Load GR00T modality metadata or derive it from official LeRobot v3 metadata."""
         modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
-        with open(modality_meta_path, "r") as f:
-            modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
-        return modality_meta
+        if modality_meta_path.exists():
+            with open(modality_meta_path, "r") as f:
+                return LeRobotModalityMetadata.model_validate(json.load(f))
+
+        raw_overrides = {}
+        if self.data_cfg is not None:
+            if hasattr(self.data_cfg, "get"):
+                raw_overrides = self.data_cfg.get("standard_video_key_map", {}) or {}
+            else:
+                raw_overrides = getattr(self.data_cfg, "standard_video_key_map", {}) or {}
+        video_key_overrides = (
+            {str(key): str(value) for key, value in raw_overrides.items()}
+            if hasattr(raw_overrides, "items")
+            else {}
+        )
+        return _build_standard_lerobot_modality_metadata(
+            self._get_lerobot_info_meta(),
+            self.modality_configs,
+            video_key_overrides=video_key_overrides,
+        )
 
     def _get_lerobot_info_meta(self) -> dict:
         """Get the metadata for the LeRobot dataset."""

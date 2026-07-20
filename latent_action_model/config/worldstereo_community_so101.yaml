@@ -1,0 +1,108 @@
+# WorldStereo LAM with discrete EMA-VQ on one LeRobot community dataset.
+# Dataset: lerobot/community_dataset_v3/EverNorif/so101-pick-pen
+
+seed_everything: 42
+
+model:
+  vision_model_id: "worldstereo:Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+  dim: 1024
+  enc_layers: 24
+  ffn_expansion_factor: 4
+  num_heads: 16
+  max_state_dim: 32
+  num_embodiments: 32
+
+  codebook_size: 64
+  code_dim: 32
+  num_queries: 1
+  vq_type: "ema_vq"
+  disable_vq: false
+  vq_kwargs:
+    layer_norm: true
+    use_cosine_sim: true
+    data_dependent_init: true
+    ema_decay: 0.99
+    ema_eps: 1.0e-5
+    beta: 0.25
+
+  num_frames: 2
+  image_hw: [256, 256]
+  patch_size: 8
+  image_aug: true
+  dual_view_aug: true
+  dec_layers: 12
+  dropout: 0.0
+  warmup_steps: 1000
+  enc_add_state: false
+  enc_modal_mask: true
+  lambda_aux: 1.0
+  loss_type: "smooth_l1"
+  state_loss_type: "l2"
+
+  latent_layer_to_use: -1
+  multi_input: false
+  norm_latents: true
+  norm_latents_type: "ln"
+  lambda_diversity: 0.0
+
+  project: lam
+  task_name: worldstereo_community_so101_vq64
+  wandb_offline: true
+
+  optimizer:
+    class_path: torch.optim.AdamW
+    init_args:
+      lr: 3.0e-4
+      weight_decay: 1.0e-2
+  exclude_bias_norm_from_wd: true
+
+  make_data_pair: false
+  output_dir: output_pairs
+
+data:
+  data_root_dir: "dataset/community_dataset_v3"
+  data_mix: "community_so101_pick_pen"
+  video_backend: "pyav"
+  preferred_video_key: "video.primary_image"
+  num_frames: 2
+  image_hw: [256, 256]
+  frame_dt_sec: 0.4
+  batch_size: 32
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: false
+  in_order: false
+  debug_repeat_batch: false
+  val_tail_ratio: 0.1
+  max_state_dim: 32
+
+trainer:
+  max_epochs: 10
+  accelerator: gpu
+  devices: auto
+  strategy: ddp_find_unused_parameters_false
+  accumulate_grad_batches: 1
+  precision: bf16-mixed
+  log_every_n_steps: 20
+  gradient_clip_val: 1.0
+  val_check_interval: 500
+  num_sanity_val_steps: 0
+  limit_val_batches: 50
+
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        verbose: true
+        save_last: true
+        save_top_k: -1
+        save_on_train_epoch_end: true
+        every_n_epochs: 1
+        filename: "{epoch}"
+    - class_path: latent_action_model.core.lam_lightinng.SaveConfigToCheckpointCallback
+
+  logger:
+    - class_path: lightning.pytorch.loggers.TensorBoardLogger
+      init_args:
+        save_dir: latent_action_model/logs
+        name: worldstereo_community_so101
