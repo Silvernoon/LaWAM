@@ -304,18 +304,26 @@ class VLATrainer(TrainerUtils):
             default=True,
             field_name="trainer.load_pretrained_policy_flow",
         )
+        load_pretrained_lam = _coerce_config_bool(
+            getattr(self.config.trainer, "load_pretrained_lam", True),
+            default=True,
+            field_name="trainer.load_pretrained_lam",
+        )
 
         if pretrained_checkpoint:
             self.model = self.load_finetune_init_weights(
                 self.model,
                 checkpoint_path=pretrained_checkpoint,
                 load_pretrained_policy_flow=load_pretrained_policy_flow,
+                load_pretrained_lam=load_pretrained_lam,
             )
             self.completed_steps = 0
             logger.info(
-                "Initialized model weights for finetune from `%s`; load_pretrained_policy_flow=%s; training starts from step 0.",
+                "Initialized model weights for finetune from `%s`; "
+                "load_pretrained_policy_flow=%s; load_pretrained_lam=%s; training starts from step 0.",
                 pretrained_checkpoint,
                 load_pretrained_policy_flow,
+                load_pretrained_lam,
             )
         else:
             logger.info("No pretrained checkpoint provided. Starting training from scratch.")

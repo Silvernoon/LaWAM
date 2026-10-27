@@ -98,11 +98,15 @@ class LatentWorldPolicyRunner:
         self,
         train_batch: LatentWorldPolicyTrainBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        primary_video = train_batch["primary_video"]
-        if primary_video.ndim != 5 or int(primary_video.shape[1]) < 1:
+        visual_video = train_batch["stereo_video"]
+        if visual_video.ndim == 6 and int(visual_video.shape[2]) >= 1:
+            visual_image = visual_video[:, :, :1, :, :, :]
+        elif visual_video.ndim == 5 and int(visual_video.shape[1]) >= 1:
+            visual_image = visual_video[:, 0, :, :, :]
+        else:
             raise ValueError(
-                "Expected `primary_video` tensor with shape [B, T, C, H, W] and T>=1 "
-                f"for aligned inference, got {tuple(primary_video.shape)}."
+                "Expected `stereo_video` as [B,V,T,C,H,W] or [B,T,C,H,W] with T>=1, "
+                f"got {tuple(visual_video.shape)}."
             )
 
         infer_batch: LatentWorldPolicyInferBatch = {
@@ -111,7 +115,7 @@ class LatentWorldPolicyRunner:
             "attention_mask": train_batch["attention_mask"],
             "act_placeholder_mask": train_batch["act_placeholder_mask"],
             "flow_placeholder_mask": train_batch["flow_placeholder_mask"],
-            "primary_image": primary_video[:, 0, :, :, :],
+            "stereo_image": visual_image,
             "state": train_batch["state"],
             "state_mask": train_batch["state_mask"],
             "embodiment_id": train_batch["embodiment_id"],

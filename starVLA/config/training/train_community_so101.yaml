@@ -1,5 +1,5 @@
 run_id: community_so101_pick_pen_worldstereo_vq64
-run_root_dir: results/Checkpoints/community_so101
+run_root_dir: /tank/test/results/Checkpoints/community_so101
 seed: 2026
 trackers:
 - wandb
@@ -10,13 +10,15 @@ is_debug: false
 framework:
   name: LaWAM
   qwenvl:
-    base_vlm: results/Checkpoints/qwen3_weights
+    base_vlm: /tank/test/Qwen3-VL-2B-Instruct
   action_model:
     future_action_window_size: 49
     past_action_window_size: 0
     action_horizon: 50
-    lam_ckpt_path: latent_action_model/logs/worldstereo_community_so101/version_0/checkpoints/last.ckpt
+    lam_ckpt_path: /tank/test/latent_action_model/logs/worldstereo_community_so101/version_0/checkpoints/last.ckpt
     lam_yaml_path: latent_action_model/config/worldstereo_community_so101.yaml
+    stereo_num_views: 2
+    stereo_include_wrist_views: true
     num_action_queries: 8
     flow_action_num_queries: 8
     perceptual_weight: 0.1
@@ -57,11 +59,12 @@ framework:
 
 datasets:
   vla_data:
-    data_root_dir: dataset/community_dataset_v3
+    data_root_dir: /tank/test/community_dataset_v3
     data_mix: community_so101_pick_pen
     standard_video_key_map:
       "video.primary_image": observation.images.image
       "video.wrist_image": observation.images.image2
+    random_single_non_wrist_view: false
     image_resolution: 256
     per_device_batch_size: 4
     val_tail_ratio: 0.1

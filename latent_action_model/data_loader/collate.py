@@ -8,14 +8,12 @@ def lam_collate(batch: Sequence[Dict], max_state_dim: int = 32) -> Dict[str, Any
     Collate fixed-format clips and proprio into a batch.
 
     Input contract (upstream dataset must guarantee):
-    - Each sample: {"frames": Tensor (T,C,H,W) uint8, "proprio": Tensor (T,D) float32, "embodiment_id": int}.
-    - Within a batch: all samples have the same (T,C,H,W), same T for proprio.
-      If D > max_state_dim, the proprio vector is truncated to the first max_state_dim dimensions.
+    - Stereo sample: {"frames": Tensor [V,T,C,H,W] uint8}; single-view sample: [T,C,H,W].
+    - Within a batch all samples share their video shape and proprio T.
+      If D > max_state_dim, proprio is truncated to max_state_dim.
 
     Returns:
-        videos: [B,T,C,H,W] uint8
-        states: [B,2,max_state_dim] float32 (start/end proprio with right padding)
-        state_mask: [B,2,max_state_dim] bool
+        videos: [B,V,T,C,H,W] for stereo or [B,T,C,H,W] for single-view
         proprio: [B,2,max_state_dim] float32 (compat alias for states)
         delta_proprio: [B,max_state_dim] float32
         embodiment_ids: [B] int64

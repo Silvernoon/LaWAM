@@ -1,0 +1,132 @@
+run_id: libero_worldstereo_paiworld_da3_adapter
+run_root_dir: /tank/test/sivn/results/Checkpoints/libero
+seed: 2026
+trackers:
+- wandb
+wandb_entity: null
+wandb_project: finetune-LIBERO-worldstereo
+is_debug: false
+framework:
+  name: LaWAM
+  qwenvl:
+    base_vlm: /tank/test/sivn/Qwen3-VL-2B-Instruct
+  action_model:
+    future_action_window_size: 49
+    past_action_window_size: 0
+    action_horizon: 50
+    lam_ckpt_path: /tank/test/sivn/lawam_ckpts/worldstereo_libero_finetune_20260728/checkpoints/last.ckpt
+    lam_yaml_path: /tank/test/sivn/lawam_ckpts/configs/worldstereo_libero_finetune.yaml
+    num_action_queries: 8
+    flow_action_num_queries: 8
+    perceptual_weight: 0.1
+    latent_action_placeholder_token: <ACT_PH>
+    flow_only_mode: false
+    enable_flow_h_t1_scheduled_sampling: false
+    flow_h_t1_pred_prob_start: 0.0
+    flow_h_t1_pred_prob_end: 1.0
+    flow_h_t1_pred_ramp_steps: 5000
+    detach_future_feature: true
+    future_prediction: true
+    enable_loss_distill: true
+    lam_encoder_distill_weight: 0.1
+    repeated_diffusion_steps: 2
+    stereo_num_views: 2
+    stereo_include_wrist_views: true
+    enable_geometry_adapter: true
+    geometry_adapter_num_heads: 8
+    geometry_adapter_dropout: 0.0
+    geometry_adapter_pose_dim: 12
+    geometry_adapter_require_camera_geometry: true
+    geometry_provider_model_id: /tank/test/sivn/models/DA3-SMALL
+    geometry_provider_input_size: 252
+    geometry_provider_use_ray_pose: true
+    flow_cfg:
+      action_dim: 32
+      state_dim: 32
+      use_state: false
+      vlm_dim: 2048
+      hidden_dim: 1024
+      attention_heads: 16
+      num_layers: 16
+      num_target_vision_tokens: -1
+      interleave_self_attention: true
+      use_alternate_vldit: true
+      attend_text_every_n_blocks: 2
+      cfg_drop_prob: 0.0
+      cfg_guidance_scale: 1.0
+      num_inference_steps: 10
+      num_timestep_buckets: 1000
+      horizon_sec: 0.4
+      noise_beta_alpha: 1.5
+      noise_beta_beta: 1.0
+      noise_s: 0.999
+      token_independent_noise: false
+      use_action_positional_embeddings: true
+      num_embodiments: 32
+datasets:
+  vla_data:
+    data_root_dir: /tank/test/sivn
+    data_mix: libero
+    image_resolution: 256
+    per_device_batch_size: 4
+    val_tail_ratio: 0.01
+    train_split_all: true
+    video_backend: pyav
+    num_frames: 2
+    enable_primary_video_aug: false
+    enable_primary_random_resized_crop: false
+    sec_chunk: 0.4
+    enable_video_frame_cache: false
+    balance_dataset_weights: false
+    drop_last: true
+    num_workers: 8
+    persistent_workers: false
+    prefetch_factor: 2
+    random_single_non_wrist_view: false
+    val_num_workers: 4
+trainer:
+  max_train_steps: 10000
+  num_warmup_steps: 500
+  save_interval: 2500
+  eval_interval: 500
+  eval_batches: 20
+  learning_rate:
+    base: 0.0001
+    action_model:
+      lr: 0.0001
+      modules:
+      - policy_backend.flow
+    world_projection:
+      lr: 0.0001
+      modules:
+      - policy_backend.vlm_to_lam
+    geometry_adapter:
+      lr: 0.0001
+      modules:
+      - policy_backend.geometry_adapter
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze:
+    freeze_vision_backbone: true
+    freeze_llm_backbone: true
+    keep_llm_first_n_layers: null
+    freeze_last_llm_layer: true
+    freeze_embedding: true
+    unfreeze_vision_merger: false
+    unfreeze_llm_last_n_layers: 0
+    unfreeze_lam_decoder: false
+  logging_frequency: 50
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  ddp_find_unused_parameters: false
+  optimizer:
+    betas:
+    - 0.9
+    - 0.95
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  pretrained_checkpoint: /tank/test/sivn/results/Checkpoints/libero/20260729_081243+libero_worldstereo_policy_finetuned_lam_from_step10000/final_model/pytorch_model.pt
+  load_pretrained_policy_flow: true
+  load_pretrained_lam: false
+  use_pretrained_dataset_statistics: false

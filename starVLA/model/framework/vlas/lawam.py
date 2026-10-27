@@ -8,6 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from latent_action_model.core.lam_model import load_latent_action_model
+from starVLA.model.framework.latent_world.cross_view_adapter import GeometryAwareCrossViewAdapter
+from starVLA.model.framework.latent_world.da3_geometry import FrozenDA3GeometryProvider
 from starVLA.model.framework.latent_world.processor_utils import (
     build_latent_world_processor_spec,
     configure_latent_world_processor,
@@ -45,6 +47,17 @@ class LatentWorldPolicyConfig:
     hf_cache_dir: Optional[Union[str, Path]] = None
     lam_ckpt_path: str = str(DEFAULT_LAM_ROOT / "logs/dino_base_ae_bridge/version_0/checkpoints/epoch=39.ckpt")
     lam_yaml_path: str = str(DEFAULT_LAM_ROOT / "logs/dino_base_ae_bridge/version_0/dino_base_ae.yaml")
+    # WorldStereo stereo stitching contract
+    stereo_num_views: int = 1
+    stereo_include_wrist_views: bool = False
+    enable_geometry_adapter: bool = False
+    geometry_adapter_num_heads: int = 8
+    geometry_adapter_dropout: float = 0.0
+    geometry_adapter_pose_dim: int = 12
+    geometry_adapter_require_camera_geometry: bool = False
+    geometry_provider_model_id: Optional[str] = None
+    geometry_provider_input_size: int = 252
+    geometry_provider_use_ray_pose: bool = False
 
     # VLM dtype
     vlm_dtype: torch.dtype = torch.bfloat16
@@ -265,6 +278,13 @@ class LatentWorldPolicyBackend(nn.Module):
 
         # 2) Load LAM.
         self.lam = load_latent_action_model(self.model_cfg.lam_ckpt_path, self.model_cfg.lam_yaml_path)
+        configured_views = int(self.model_cfg.stereo_num_views)
+        lam_views = int(getattr(self.lam, "num_views", 1))
+        if configured_views != lam_views:
+            raise ValueError(
+                "LaWAM/WorldStereo view-count mismatch: "
+                f"action_model.stereo_num_views={configured_views}, LAM model.num_views={lam_views}."
+            )
 
         # 3) Create trainable query and mapping head.
         self.num_action_queries = int(self.model_cfg.num_action_queries)
@@ -298,6 +318,39 @@ class LatentWorldPolicyBackend(nn.Module):
         lam_num_tokens = int(lam_grid_h * lam_grid_w) if lam_grid_h > 0 and lam_grid_w > 0 else int(
             self.model_cfg.flow_cfg.num_vision_tokens
         )
+        self.geometry_adapter: Optional[GeometryAwareCrossViewAdapter] = None
+        if bool(self.model_cfg.enable_geometry_adapter):
+            if configured_views < 2:
+                raise ValueError(
+                    "enable_geometry_adapter=True requires action_model.stereo_num_views >= 2."
+                )
+            if lam_grid_h <= 0 or lam_grid_w <= 0 or lam_grid_w % configured_views != 0:
+                raise ValueError(
+                    "Geometry adapter requires a valid stitched LAM grid divisible by the view count: "
+                    f"grid=({lam_grid_h},{lam_grid_w}), views={configured_views}."
+                )
+            self.geometry_adapter = GeometryAwareCrossViewAdapter(
+                feature_dim=lam_vision_dim,
+                num_views=configured_views,
+                grid_hw_per_view=(lam_grid_h, lam_grid_w // configured_views),
+                num_heads=int(self.model_cfg.geometry_adapter_num_heads),
+                dropout=float(self.model_cfg.geometry_adapter_dropout),
+                pose_dim=int(self.model_cfg.geometry_adapter_pose_dim),
+                require_camera_geometry=bool(self.model_cfg.geometry_adapter_require_camera_geometry),
+            )
+        self.geometry_provider: Optional[FrozenDA3GeometryProvider] = None
+        if self.model_cfg.geometry_provider_model_id:
+            if self.geometry_adapter is None:
+                raise ValueError(
+                    "geometry_provider_model_id requires enable_geometry_adapter=True."
+                )
+            self.geometry_provider = FrozenDA3GeometryProvider(
+                model_id=str(self.model_cfg.geometry_provider_model_id),
+                input_size=int(self.model_cfg.geometry_provider_input_size),
+                grid_hw_per_view=(lam_grid_h, lam_grid_w // configured_views),
+                use_ray_pose=bool(self.model_cfg.geometry_provider_use_ray_pose),
+                cache_dir=self.model_cfg.hf_cache_dir,
+            )
         if int(self.model_cfg.flow_cfg.vision_dim) != lam_vision_dim:
             print(
                 f"[LatentWorldPolicyBackend] flow_cfg.vision_dim={self.model_cfg.flow_cfg.vision_dim} "
@@ -434,7 +487,16 @@ class LatentWorldPolicyBackend(nn.Module):
         if expected_t <= 0:
             return primary_video
 
-        cur_t = int(primary_video.shape[1])
+        if primary_video.ndim == 6:
+            time_dim = 2
+        elif primary_video.ndim == 5:
+            time_dim = 1
+        else:
+            raise ValueError(
+                "LAM distill teacher expects [B,T,C,H,W] or [B,V,T,C,H,W], "
+                f"got {tuple(primary_video.shape)}."
+            )
+        cur_t = int(primary_video.shape[time_dim])
         if cur_t == expected_t:
             return primary_video
         if cur_t < expected_t:
@@ -443,7 +505,7 @@ class LatentWorldPolicyBackend(nn.Module):
                 f"but LAM encoder expects num_frames={expected_t}."
             )
         idx = torch.linspace(0, cur_t - 1, steps=expected_t, device=primary_video.device).round().long()
-        return primary_video.index_select(1, idx)
+        return primary_video.index_select(time_dim, idx)
 
     def _run_lam_teacher(self, *, primary_video: torch.Tensor, embodiment_id: torch.Tensor) -> torch.Tensor:
         primary_video_t = self._build_lam_teacher_inputs_for_distill(primary_video)
@@ -524,13 +586,12 @@ class LatentWorldPolicyBackend(nn.Module):
         return self
 
     def sync_training_modes(self, mode: bool = True) -> None:
-        sync_managed_modules_training_mode(
-            self.vlm,
-            self.lam,
-            self.flow,
-            self.vlm_to_lam,
-            mode=mode,
-        )
+        managed_modules = [self.vlm, self.lam, self.flow, self.vlm_to_lam]
+        if self.geometry_adapter is not None:
+            managed_modules.append(self.geometry_adapter)
+        if self.geometry_provider is not None:
+            managed_modules.append(self.geometry_provider)
+        sync_managed_modules_training_mode(*managed_modules, mode=mode)
 
     def set_flow_train_step(self, step: int) -> None:
         self._flow_train_step = max(0, int(step))
@@ -606,6 +667,21 @@ class LatentWorldPolicyBackend(nn.Module):
     def _prepare_infer_batch(self, *, batch: LatentWorldPolicyInferBatch) -> LatentWorldPolicyInferBatch:
         return batch
 
+    def _resolve_camera_geometry(
+        self,
+        *,
+        prepared_batch: Union[LatentWorldPolicyInferBatch, LatentWorldPolicyTrainBatch],
+        visual_input: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        camera_rays = prepared_batch.get("camera_rays")
+        camera_poses = prepared_batch.get("camera_poses")
+        if (camera_rays is None) != (camera_poses is None):
+            raise ValueError("camera_rays and camera_poses must be provided together.")
+        if camera_rays is None and self.geometry_provider is not None:
+            camera_rays, camera_poses = self.geometry_provider(visual_input)
+        return camera_rays, camera_poses
+
+
     def _run_shared_encoding_core(
         self,
         *,
@@ -643,6 +719,16 @@ class LatentWorldPolicyBackend(nn.Module):
 
             if features is None:
                 raise ValueError(f"[{source}] lam visual feature extraction returned None; check LAM config.")
+            if self.geometry_adapter is not None:
+                camera_rays, camera_poses = self._resolve_camera_geometry(
+                    prepared_batch=prepared_batch,
+                    visual_input=primary_visual_input,
+                )
+                features = self.geometry_adapter(
+                    features,
+                    camera_rays=camera_rays,
+                    camera_poses=camera_poses,
+                )
             h_t_original = features[:, 0, :, :]
             h_t = h_t_original
             h_t1_gt = features[:, -1, :, :]
@@ -674,7 +760,7 @@ class LatentWorldPolicyBackend(nn.Module):
     ) -> PolicyEncodingState:
         return self._run_shared_encoding_core(
             prepared_batch=prepared_batch,
-            primary_visual_input=prepared_batch["primary_video"],
+            primary_visual_input=prepared_batch["stereo_video"],
             source=source,
             lam_features_with_no_grad=lam_features_with_no_grad,
         )
@@ -688,7 +774,7 @@ class LatentWorldPolicyBackend(nn.Module):
     ) -> PolicyEncodingState:
         return self._run_shared_encoding_core(
             prepared_batch=prepared_batch,
-            primary_visual_input=prepared_batch["primary_image"],
+            primary_visual_input=prepared_batch["stereo_image"],
             source=source,
             lam_features_with_no_grad=lam_features_with_no_grad,
         )
@@ -721,7 +807,7 @@ class LatentWorldPolicyBackend(nn.Module):
             if bool(self.model_cfg.enable_loss_distill):
                 loss_distill = self._compute_distill_loss(
                     pred_latent=shared.pred_action_emb,
-                    primary_video=prepared_batch["primary_video"],
+                    primary_video=prepared_batch["stereo_video"],
                     embodiment_id=prepared_batch["embodiment_id"],
                 )
 

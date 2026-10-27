@@ -452,8 +452,13 @@ class TrainerUtils:
         return model
 
     @staticmethod
-    def load_finetune_init_weights(model, checkpoint_path: str, load_pretrained_policy_flow: bool = True):
-        """Initialize a model from a finetune checkpoint with relaxed key/shape matching."""
+    def load_finetune_init_weights(
+        model,
+        checkpoint_path: str,
+        load_pretrained_policy_flow: bool = True,
+        load_pretrained_lam: bool = True,
+    ):
+        """Initialize a model from a finetune checkpoint with explicit module selection."""
         def _info(msg, *args):
             try:
                 logger.info(msg, *args)
@@ -499,11 +504,20 @@ class TrainerUtils:
         unexpected_keys = []
         incompatible_shapes = []
         skipped_policy_flow_keys = []
+        skipped_lam_keys = []
         for key, value in checkpoint.items():
             if (not load_pretrained_policy_flow) and (
-                key == "policy_backend.flow" or key.startswith("policy_backend.flow.")
+                key == "policy_backend.flow"
+                or key.startswith("policy_backend.flow.")
+                or key == "policy_action_head"
+                or key.startswith("policy_action_head.")
             ):
                 skipped_policy_flow_keys.append(key)
+                continue
+            if (not load_pretrained_lam) and (
+                key == "policy_backend.lam" or key.startswith("policy_backend.lam.")
+            ):
+                skipped_lam_keys.append(key)
                 continue
 
             if key not in model_state_dict:
@@ -536,6 +550,17 @@ class TrainerUtils:
                 len(skipped_policy_flow_keys),
                 skipped_policy_flow_keys[:10],
             )
+        if skipped_lam_keys:
+            skipped_lam_key_set = set(skipped_lam_keys)
+            skipped_lam_missing_keys = sorted(skipped_lam_key_set.intersection(missing_keys))
+            intentionally_skipped_keys.extend(skipped_lam_missing_keys)
+            missing_keys = sorted(set(missing_keys) - skipped_lam_key_set)
+            _info(
+                "Relaxed finetune init skipped `policy_backend.lam` weights for `%s`: count=%d sample=%s",
+                checkpoint_path,
+                len(skipped_lam_keys),
+                skipped_lam_keys[:10],
+            )
         if unexpected_keys:
             _warn(
                 "Relaxed finetune init ignored unexpected checkpoint keys for `%s`: count=%d sample=%s",
@@ -556,7 +581,7 @@ class TrainerUtils:
             )
         if intentionally_skipped_keys:
             _info(
-                "Relaxed finetune init kept `policy_backend.flow` at existing initialization for `%s`: count=%d sample=%s",
+                "Relaxed finetune init preserved target-initialized module weights for `%s`: count=%d sample=%s",
                 checkpoint_path,
                 len(intentionally_skipped_keys),
                 intentionally_skipped_keys[:10],

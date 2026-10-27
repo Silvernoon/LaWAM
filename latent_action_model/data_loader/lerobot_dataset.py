@@ -31,6 +31,8 @@ def _build_modality_config(
     state_keys: Optional[Sequence[str]] = None,
     include_action: bool = False,
     include_language: bool = False,
+    num_views: int = 1,
+    include_wrist_views: bool = False,
 ) -> Dict[str, ModalityConfig]:
     """
     Clone ROBOT_TYPE_CONFIG_MAP[robot_type].modality_config() and override delta_indices.
@@ -49,7 +51,14 @@ def _build_modality_config(
     video_keys = filter_lam_video_keys(
         base_video_keys=base_cfg["video"].modality_keys,
         preferred_video_key=preferred_video_key,
+        include_wrist_views=include_wrist_views,
     )
+    if len(video_keys) < int(num_views):
+        raise ValueError(
+            f"LAM requires num_views={num_views}, but robot_type={robot_type} provides only "
+            f"{len(video_keys)} compatible streams: {video_keys}."
+        )
+    video_keys = video_keys[: int(num_views)]
     video_modality = override_delta(base_cfg["video"], video_keys)
 
     # state
@@ -102,6 +111,8 @@ class LeRobotLAMDataset(Dataset):
         preferred_video_key: Optional[str] = None,
         state_keys: Optional[Sequence[str]] = None,
         image_hw: Tuple[int, int] = (256, 256),
+        num_views: int = 1,
+        include_wrist_views: bool = False,
         *,
         frame_dt_sec: float,
         human_frame_dt_sec: Optional[float] = None,
@@ -127,6 +138,8 @@ class LeRobotLAMDataset(Dataset):
                 f"val_tail_ratio must be in [0.0, 1.0), got {val_tail_ratio}"
             )
 
+        if int(num_views) < 1:
+            raise ValueError(f"num_views must be >= 1, got {num_views}.")
         self.data_root_dir = Path(data_root_dir)
         self.data_mix = data_mix
         self.num_frames = num_frames
@@ -134,6 +147,8 @@ class LeRobotLAMDataset(Dataset):
         self.val_tail_ratio = float(val_tail_ratio)
         self.preferred_video_key = preferred_video_key
         self.state_keys = list(state_keys) if state_keys else None
+        self.num_views = int(num_views)
+        self.include_wrist_views = bool(include_wrist_views)
         self.image_hw = (int(image_hw[0]), int(image_hw[1]))
         self.frame_dt_sec = frame_dt_sec
         self.human_frame_dt_sec = human_frame_dt_sec
@@ -169,6 +184,8 @@ class LeRobotLAMDataset(Dataset):
                 preferred_video_key=self.preferred_video_key,
                 state_keys=self.state_keys,
                 include_action=False,
+                num_views=self.num_views,
+                include_wrist_views=self.include_wrist_views,
                 include_language=False,
             )
             # Map robot_type to EmbodimentTag
@@ -186,7 +203,7 @@ class LeRobotLAMDataset(Dataset):
                 data_cfg=data_cfg,
             )
             self._apply_temporal_delta_indices(ds)
-            ds._lam_transforms_by_video_key = self._build_video_key_transform_cache(
+            ds._lam_transform = self._build_video_transform(
                 dataset=ds,
                 robot_type=robot_type,
                 state_keys=modality_cfg["state"].modality_keys,
@@ -199,7 +216,7 @@ class LeRobotLAMDataset(Dataset):
             mode=self.mode,
             balance_dataset_weights=True,
             seed=42,
-            random_single_non_wrist_view=True,
+            random_single_non_wrist_view=False,
             data_cfg=data_cfg,
         )
 
@@ -237,28 +254,38 @@ class LeRobotLAMDataset(Dataset):
             return 10000
         return len(self.mixture)
 
-    def _build_video_key_transform_cache(
+    def _build_video_transform(
         self,
         dataset: LeRobotSingleDataset,
         robot_type: str,
         state_keys: Sequence[str],
         video_keys: Sequence[str],
-    ) -> Dict[str, ComposedModalityTransform]:
-        transforms_by_video_key: Dict[str, ComposedModalityTransform] = {}
-        for video_key in video_keys:
-            lam_transform = build_lam_dataset_transform(
-                robot_type=robot_type,
-                image_hw=self.image_hw,
-                state_keys=state_keys,
-                video_keys=[video_key],
-            )
-            lam_transform.set_metadata(dataset.metadata)
-            if self.mode == "train":
-                lam_transform.train()
-            else:
-                lam_transform.eval()
-            transforms_by_video_key[video_key] = lam_transform
-        return transforms_by_video_key
+    ) -> ComposedModalityTransform:
+        transform = build_lam_dataset_transform(
+            robot_type=robot_type,
+            image_hw=self.image_hw,
+            state_keys=state_keys,
+            video_keys=video_keys,
+            include_wrist_views=self.include_wrist_views,
+        )
+        transform.set_metadata(dataset.metadata)
+        if self.mode == "train":
+            transform.train()
+        else:
+            transform.eval()
+        return transform
+    def _align_frame_count(self, frames: torch.Tensor, *, video_key: str) -> torch.Tensor:
+        frame_count = int(frames.shape[0])
+        if frame_count == self.num_frames:
+            return frames
+        if frame_count < 1:
+            raise ValueError(f"LAM video stream {video_key} contains no frames.")
+        if frame_count < self.num_frames:
+            padding = frames[-1:].expand(self.num_frames - frame_count, *frames.shape[1:])
+            return torch.cat([frames, padding], dim=0).contiguous()
+        indices = torch.linspace(0, frame_count - 1, self.num_frames).round().long()
+        return frames.index_select(0, indices).contiguous()
+
 
     def _try_get_sample(self, index: int) -> Dict:
         dataset, traj_id, base_index, selected_video_keys = self.mixture._sample_candidate(
@@ -271,31 +298,32 @@ class LeRobotLAMDataset(Dataset):
             modality_keys_override={"video": selected_video_keys},
         )
 
-        # video: only use non-wrist keys selected by mixture sampling.
-        available_video_keys = [k for k in selected_video_keys if "wrist" not in k.lower()]
-        if not available_video_keys:
+        available_video_keys = list(selected_video_keys[: self.num_views])
+        if len(available_video_keys) != self.num_views:
             raise RuntimeError(
-                f"No non-wrist video key selected for dataset {dataset.dataset_name}. "
-                f"selected_video_keys={selected_video_keys}"
+                f"LAM stereo sample requires {self.num_views} views, got {available_video_keys} "
+                f"for dataset {dataset.dataset_name}."
             )
-        if self.preferred_video_key and self.preferred_video_key in available_video_keys:
-            video_key = self.preferred_video_key
-        else:
-            video_key = available_video_keys[0]
-        lam_transform = dataset._lam_transforms_by_video_key[video_key]
-        data = lam_transform(raw_data)
-        frames = data[video_key]
-        if isinstance(frames, torch.Tensor):
-            frames_t = frames.contiguous()
-            if frames_t.dtype != torch.uint8:
-                frames_t = frames_t.to(torch.uint8)
-        else:
-            frames_t = torch.from_numpy(np.ascontiguousarray(frames)).to(torch.uint8)
-        if frames_t.ndim != 4 or frames_t.shape[1] != 3:
-            raise ValueError(
-                f"LAM dataset expects frames as [T, C, H, W], got {tuple(frames_t.shape)} "
-                f"for dataset={dataset.dataset_name} video_key={video_key}."
-            )
+        data = dataset._lam_transform(raw_data)
+        frame_views: List[torch.Tensor] = []
+        for video_key in available_video_keys:
+            frames = data[video_key]
+            if isinstance(frames, torch.Tensor):
+                frames_t = frames.contiguous()
+                if frames_t.dtype != torch.uint8:
+                    frames_t = frames_t.to(torch.uint8)
+            else:
+                frames_t = torch.from_numpy(np.ascontiguousarray(frames)).to(torch.uint8)
+            if frames_t.ndim != 4 or frames_t.shape[1] != 3:
+                raise ValueError(
+                    f"LAM dataset expects each view as [T,C,H,W], got {tuple(frames_t.shape)} "
+                    f"for dataset={dataset.dataset_name} video_key={video_key}."
+                )
+            frames_t = self._align_frame_count(frames_t, video_key=video_key)
+            frame_views.append(frames_t)
+        frames_t = torch.stack(frame_views, dim=0).contiguous()
+        if self.num_views == 1:
+            frames_t = frames_t[0]
 
         # state (proprio)
         proprio_tensors: List[torch.Tensor] = []

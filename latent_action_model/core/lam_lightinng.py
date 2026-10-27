@@ -64,9 +64,11 @@ class VJEPA_LAM(LightningModule):
         num_embodiments: int = 32,
         image_hw: Tuple[int, int] = LAM_IMAGE_HW,
         patch_size: int = LAM_PATCH_SIZE,
+        num_views: int = 1,
         image_aug: bool = True,
         dual_view_aug: bool = False,
         decoder_last_ln: bool = True,
+        init_checkpoint: Optional[str] = None,
         **kwargs
     ):
         super().__init__()
@@ -77,6 +79,9 @@ class VJEPA_LAM(LightningModule):
         self.image_hw = (int(image_hw[0]), int(image_hw[1]))
         self.patch_size = int(patch_size)
         self.image_aug = image_aug
+        self.num_views = int(num_views)
+        if self.num_views < 1:
+            raise ValueError(f"LAM num_views must be >= 1, got {self.num_views}.")
         self.dual_view_aug = bool(dual_view_aug)
         if self.patch_size not in (8, 16):
             raise ValueError(
@@ -111,6 +116,7 @@ class VJEPA_LAM(LightningModule):
             image_hw=self.image_hw,
             patch_size=self.patch_size,
             decoder_last_ln=decoder_last_ln,
+            num_views=self.num_views,
         )
 
 
@@ -160,6 +166,23 @@ class VJEPA_LAM(LightningModule):
         self._spike_armed = False
         self._spike_arm_step: Optional[int] = None
         self._last_step_tensors: Dict[str, Tensor] = {}
+
+        if init_checkpoint:
+            checkpoint_path = Path(init_checkpoint).expanduser()
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(f"LAM initialization checkpoint does not exist: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else None
+            if not isinstance(state_dict, dict):
+                raise TypeError(
+                    "LAM initialization checkpoint must be a state dict or contain a `state_dict` mapping, "
+                    f"got {type(checkpoint).__name__} from {checkpoint_path}."
+                )
+            self.load_state_dict(state_dict, strict=True)
+            print(
+                f"[LAM_INIT] Loaded weights-only initialization from {checkpoint_path} "
+                f"({len(state_dict)} tensors)."
+            )
 
     def _is_global_zero(self) -> bool:
         trainer = getattr(self, "trainer", None)
@@ -542,6 +565,28 @@ class VJEPA_LAM(LightningModule):
         ordered_view2 = [view2_by_index[i] for i in range(len(videos))]
         return torch.stack(ordered_view1, dim=0), torch.stack(ordered_view2, dim=0)
 
+    def _augment_stereo_batch_on_gpu(
+        self,
+        videos: torch.Tensor,
+        *,
+        training: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if videos.ndim != 6:
+            raise ValueError(f"Expected stereo videos [B,V,T,C,H,W], got {tuple(videos.shape)}.")
+        batch_size, num_views, num_frames = (int(videos.shape[0]), int(videos.shape[1]), int(videos.shape[2]))
+        if num_views != self.num_views:
+            raise ValueError(f"Stereo view mismatch: batch V={num_views}, configured num_views={self.num_views}.")
+        flattened = videos.reshape(batch_size, num_views * num_frames, *videos.shape[3:])
+        flattened_nhwc = self._as_nhwc_uint8_batch(flattened)
+        video1, video2 = gpu_two_view_video_aug(
+            flattened_nhwc,
+            output_size=self.image_hw,
+            training=training,
+            dual_view_aug=self.dual_view_aug,
+        )
+        output_shape = (batch_size, num_views, num_frames, *video1.shape[2:])
+        return video1.reshape(output_shape), video2.reshape(output_shape)
+
     def transfer_batch_to_device(self, batch: Any, device: torch.device, dataloader_idx: int) -> Any:
         """Move batch to device and build video1/video2 on GPU when raw uint8 clips are provided."""
         batch = super().transfer_batch_to_device(batch, device, dataloader_idx)
@@ -552,6 +597,11 @@ class VJEPA_LAM(LightningModule):
         videos = batch["videos"]
 
         if isinstance(videos, torch.Tensor):
+            if videos.ndim == 6:
+                video1, video2 = self._augment_stereo_batch_on_gpu(videos, training=training_aug)
+                batch["videos"] = video1
+                batch["dec_videos"] = video2
+                return batch
             if videos.ndim == 5 and (videos.shape[-1] == 3 or videos.shape[2] == 3):
                 videos_nhwc = self._as_nhwc_uint8_batch(videos)
                 video1, video2 = gpu_two_view_video_aug(
@@ -739,6 +789,12 @@ class VJEPA_LAM(LightningModule):
                     logs["orthogonal_loss"] = vq_module.last_orthogonal_loss
                 if hasattr(vq_module, "last_avg_unique_codes"):
                     logs["avg_unique_codes"] = vq_module.last_avg_unique_codes
+                if hasattr(vq_module, "last_active_code_count"):
+                    logs["active_code_count"] = vq_module.last_active_code_count
+                if hasattr(vq_module, "last_dominant_code_fraction"):
+                    logs["dominant_code_fraction"] = vq_module.last_dominant_code_fraction
+                if hasattr(vq_module, "last_usage_perplexity"):
+                    logs["usage_perplexity"] = vq_module.last_usage_perplexity
                 if self.lambda_diversity >0:
                     logs["entropy_loss"] = entropy_loss
                 if hasattr(vq_module, "last_slot_inter_redundancy") and vq_module.last_slot_inter_redundancy is not None:
@@ -943,29 +999,42 @@ class VJEPA_LAM(LightningModule):
         
 
 class CodebookMaintenanceCallback(pl.Callback):
-    def __init__(self, interval_steps: int = 1000):
+    def __init__(
+        self,
+        interval_steps: int = 1000,
+        start_step: int = 100,
+        end_step: Optional[int] = None,
+    ):
         super().__init__()
-        self.interval_steps = interval_steps
+        if interval_steps <= 0:
+            raise ValueError("interval_steps must be positive")
+        self.interval_steps = int(interval_steps)
+        self.start_step = int(start_step)
+        self.end_step = None if end_step is None else int(end_step)
+        self._last_maintenance_step = -1
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
-    # def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        # if trainer.global_step% self.interval_steps != 0 or trainer.global_step < 100:
-        #     return
-        if (trainer.global_step % self.interval_steps == 0 and trainer.global_step <= 10000 and trainer.global_step > 100):
+        step = int(trainer.global_step)
+        if step <= self.start_step or step % self.interval_steps != 0:
+            return
+        if self.end_step is not None and step > self.end_step:
+            return
+        if step == self._last_maintenance_step:
+            return
+        self._last_maintenance_step = step
 
-            is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if is_distributed:
+            torch.distributed.barrier()
 
-            if is_distributed:
-                torch.distributed.barrier()
+        with torch.no_grad():
+            if hasattr(pl_module.lam.vq, "replace_unused_codebooks"):
+                pl_module.lam.vq.replace_unused_codebooks()
+            if hasattr(pl_module.lam.vq, "reset_node_count"):
+                pl_module.lam.vq.reset_node_count()
 
-            with torch.no_grad():
-                if hasattr(pl_module.lam.vq, 'replace_unused_codebooks'):
-                    _num_replaced, _replaced_indices = pl_module.lam.vq.replace_unused_codebooks()
-                if hasattr(pl_module.lam.vq, 'reset_node_count'):
-                    pl_module.lam.vq.reset_node_count()
-
-            if is_distributed:
-                torch.distributed.barrier()
+        if is_distributed:
+            torch.distributed.barrier()
 
 
 class SaveConfigToCheckpointCallback(pl.Callback):

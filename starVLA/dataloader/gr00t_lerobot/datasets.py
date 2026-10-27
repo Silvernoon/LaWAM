@@ -2590,7 +2590,7 @@ class LeRobotMixtureDataset(Dataset):
             print(f"Error: Invalid weights sum: {weights_sum}")
             # Fallback to equal weights
             self._dataset_sampling_weights = np.ones(len(self.datasets)) / len(self.datasets)
-            print(f"Fallback to equal weights")
+            print("Fallback to equal weights")
             self._effective_dataset_sampling_weights = self._dataset_sampling_weights.copy()
         else:
             self._effective_dataset_sampling_weights = self._dataset_sampling_weights.copy()
@@ -2806,14 +2806,14 @@ class LeRobotMixtureDataset(Dataset):
         selected_video_keys: list[str],
     ) -> dict:
         primary_videos: list[torch.Tensor] = []
-        wrist_frames: list[torch.Tensor] = []
+        wrist_videos: list[torch.Tensor] = []
         for video_key in selected_video_keys:
             view_frames = data[video_key]
             view_frames = view_frames.contiguous()
             if "wrist" not in video_key.lower():
                 primary_videos.append(view_frames)
             else:
-                wrist_frames.append(view_frames[0].contiguous())
+                wrist_videos.append(view_frames)
 
         if not primary_videos:
             raise ValueError("LatentWorld raw sample could not resolve any primary video views.")
@@ -2821,12 +2821,13 @@ class LeRobotMixtureDataset(Dataset):
         primary_video_tensor = torch.stack(primary_videos, dim=0).contiguous()
         reference_primary_video = primary_video_tensor[0]
 
-        height = int(reference_primary_video.shape[-2])
-        width = int(reference_primary_video.shape[-1])
-        if wrist_frames:
-            wrist_images = torch.stack(wrist_frames, dim=0)
+        if wrist_videos:
+            wrist_video_tensor = torch.stack(wrist_videos, dim=0).contiguous()
         else:
-            wrist_images = torch.empty((0, 3, height, width), dtype=reference_primary_video.dtype)
+            wrist_video_tensor = torch.empty(
+                (0, *reference_primary_video.shape),
+                dtype=reference_primary_video.dtype,
+            )
 
         language = data[dataset.modality_keys["language"][0]][0]
         if "action" not in data or "state" not in data:
@@ -2836,7 +2837,7 @@ class LeRobotMixtureDataset(Dataset):
 
         return {
             "primary_videos": primary_video_tensor,
-            "wrist_images": wrist_images,
+            "wrist_videos": wrist_video_tensor,
             "lang": str(language),
             "state": self._ensure_sequence_2d_tensor(data["state"]),
             "action": self._ensure_sequence_2d_tensor(data["action"]),
@@ -2878,7 +2879,7 @@ class LeRobotMixtureDataset(Dataset):
                 if attempt < max_retries - 1:
                     # Log the error but continue trying
                     print(f"Attempt {attempt + 1}/{max_retries} failed for index {current_index}: {e}")
-                    print(f"Retrying with new sample...")
+                    print("Retrying with new sample...")
                     current_index = self._get_retry_index(index, attempt, reason="exception")
                 else:
                     # All retries exhausted
@@ -2948,7 +2949,7 @@ class LeRobotMixtureDataset(Dataset):
         
         result = int(max_ratio)
         if result == 0:
-            print(f"Warning: Dataset mixture length is 0")
+            print("Warning: Dataset mixture length is 0")
         return result
 
     @staticmethod

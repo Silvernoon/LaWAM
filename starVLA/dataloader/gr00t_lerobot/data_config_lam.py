@@ -42,29 +42,28 @@ def _normalize_state_keys(
 def filter_lam_video_keys(
     base_video_keys: Sequence[str],
     preferred_video_key: str | None = None,
+    include_wrist_views: bool = False,
 ) -> list[str]:
-    """
-    Keep all non-wrist camera keys for LAM.
-    Single non-wrist view selection is handled downstream by mixture sampling
-    policy.
-    """
-    filtered_video_keys = [key for key in base_video_keys if "wrist" not in key.lower()]
+    """Select the camera streams used by LAM, preserving configured order."""
+    filtered_video_keys = [
+        key for key in base_video_keys if include_wrist_views or "wrist" not in key.lower()
+    ]
     if not filtered_video_keys:
         raise ValueError(
-            "No non-wrist video keys available for LAM. "
-            f"Received keys: {list(base_video_keys)}"
+            "No compatible video keys available for LAM. "
+            f"include_wrist_views={include_wrist_views}, received keys={list(base_video_keys)}"
         )
 
     if preferred_video_key is not None:
         if preferred_video_key in filtered_video_keys:
-            # Keep all non-wrist keys, but place preferred key first.
+            # Keep all compatible keys, but place preferred key first.
             return [preferred_video_key] + [
                 key for key in filtered_video_keys if key != preferred_video_key
             ]
         if preferred_video_key in base_video_keys:
             raise ValueError(
-                f"Preferred video key '{preferred_video_key}' is filtered out because it is a wrist view. "
-                f"Available non-wrist keys: {filtered_video_keys}"
+                f"Preferred video key '{preferred_video_key}' is excluded by the configured view policy. "
+                f"Available keys: {filtered_video_keys}"
             )
 
     return filtered_video_keys
@@ -160,6 +159,7 @@ def build_lam_dataset_transform(
     state_keys: Sequence[str] | None = None,
     *,
     video_keys: Sequence[str] | None = None,
+    include_wrist_views: bool = False,
 ) -> ComposedModalityTransform:
     """
     Build the LAM training transform:
@@ -180,7 +180,10 @@ def build_lam_dataset_transform(
     if "video" not in base_modality_cfg:
         raise ValueError(f"Robot type '{robot_type}' has no video modality config.")
 
-    base_video_keys = filter_lam_video_keys(base_modality_cfg["video"].modality_keys)
+    base_video_keys = filter_lam_video_keys(
+        base_modality_cfg["video"].modality_keys,
+        include_wrist_views=include_wrist_views,
+    )
     if video_keys is None:
         filtered_video_keys = list(base_video_keys)
     else:
@@ -190,8 +193,8 @@ def build_lam_dataset_transform(
         unknown_video_keys = [key for key in filtered_video_keys if key not in base_video_keys]
         if unknown_video_keys:
             raise ValueError(
-                f"Requested video keys are not present in filtered base config: {unknown_video_keys}. "
-                f"Available non-wrist keys: {base_video_keys}"
+                f"Requested video keys are not present in the configured LAM view set: {unknown_video_keys}. "
+                f"Available keys: {base_video_keys}"
             )
 
     base_transform = base_cfg.transform(image_hw=image_hw)

@@ -186,6 +186,8 @@ class VQ(nn.Module):
         data_dependent_init: bool = True,
         kmeans_iters: int = 10,
         kmeans_max_samples: int = 100000,
+        kmeans_min_samples: Optional[int] = None,
+        usage_reservoir_size: Optional[int] = None,
         beta: float = 0.25,
         orthogonal_loss_weight: float = 0.0,
         lambda_sample_entropy: float = 0.0,
@@ -195,6 +197,7 @@ class VQ(nn.Module):
         layer_norm: bool=False,
         scale: float=1.0,
         use_soft_assignment: bool = False,
+        stochastic_assignment: bool = False,
         use_temperature_schedule: bool = False,
         temperature_start: float = 1.0,
         temperature_end: float = 0.1,
@@ -210,12 +213,23 @@ class VQ(nn.Module):
         self.data_dependent_init = bool(data_dependent_init)
         self.kmeans_iters = int(kmeans_iters)
         self.kmeans_max_samples = int(kmeans_max_samples)
+        self.kmeans_min_samples = max(
+            self.codebook_size,
+            self.codebook_size if kmeans_min_samples is None else int(kmeans_min_samples),
+        )
+        self.usage_reservoir_size = max(
+            self.kmeans_min_samples,
+            self.kmeans_min_samples if usage_reservoir_size is None else int(usage_reservoir_size),
+        )
         self.beta = beta
         self.orthogonal_loss_weight = float(orthogonal_loss_weight)
         self.lambda_sample_entropy = float(lambda_sample_entropy)
         self.lambda_codebook_entropy = float(lambda_codebook_entropy)
         self.max_code_replaced_per_step = int(max_code_replaced_per_step)
         self.use_soft_assignment = bool(use_soft_assignment)
+        self.stochastic_assignment = bool(stochastic_assignment)
+        if self.stochastic_assignment and not self.use_soft_assignment:
+            raise ValueError("stochastic_assignment requires use_soft_assignment=True")
         self.use_temperature_schedule = bool(use_temperature_schedule)
         self.temperature_start = float(temperature_start)
         self.temperature_end = float(temperature_end)
@@ -244,6 +258,19 @@ class VQ(nn.Module):
         # self.register_buffer('kmeans_initialized', torch.tensor(0, dtype=torch.bool))
         # self.initialized = torch.tensor(0, dtype=torch.bool)
         self.register_buffer('initialized', torch.tensor(0, dtype=torch.bool))
+        self.register_buffer(
+            "_kmeans_init_buffer",
+            torch.empty(self.kmeans_min_samples, self.code_dim),
+            persistent=False,
+        )
+        self.register_buffer("_kmeans_init_count", torch.zeros((), dtype=torch.long), persistent=False)
+        self.register_buffer(
+            "_recent_nodes",
+            torch.empty(self.usage_reservoir_size, self.code_dim),
+            persistent=False,
+        )
+        self.register_buffer("_recent_nodes_count", torch.zeros((), dtype=torch.long), persistent=False)
+        self.register_buffer("_recent_nodes_cursor", torch.zeros((), dtype=torch.long), persistent=False)
         if not self.data_dependent_init:
             self.initialized.fill_(True)
 
@@ -342,9 +369,10 @@ class VQ(nn.Module):
             return
 
         if N < K:
-            extra_indices = torch.randint(0, N, (K - N,), device=all_nodes.device)
-            all_nodes = torch.cat([all_nodes, all_nodes[extra_indices]], dim=0)
-            N = all_nodes.shape[0]
+            raise ValueError(
+                f"KMeans initialization requires at least {K} samples, got {N}. "
+                "Buffer more encoder outputs before initializing the codebook."
+            )
 
         if rank == 0:
             print("=" * 50, "\n")
@@ -360,10 +388,16 @@ class VQ(nn.Module):
                 dist2 = nodes_norm + centers_norm.unsqueeze(0) - 2.0 * all_nodes @ centers.t()
                 dist2 = torch.clamp(dist2, min=0.0)
                 assignment = torch.argmin(dist2, dim=1)                                 # [N]
+                one_hot = F.one_hot(assignment, num_classes=K).to(all_nodes.dtype)
 
-                one_hot = F.one_hot(assignment, num_classes=K).to(all_nodes.dtype)      # [N, K]
-                counts = one_hot.sum(dim=0).clamp(min=1.0).unsqueeze(-1)                # [K, 1]
-                centers = (one_hot.t() @ all_nodes) / counts                            # [K, D]
+                counts = one_hot.sum(dim=0)                                      # [K]
+                updated_centers = (one_hot.t() @ all_nodes) / counts.clamp(min=1.0).unsqueeze(-1)
+                empty_mask = counts == 0
+                if empty_mask.any():
+                    num_empty = int(empty_mask.sum().item())
+                    replacement_indices = torch.randperm(N, device=all_nodes.device)[:num_empty]
+                    updated_centers[empty_mask] = all_nodes[replacement_indices]
+                centers = updated_centers
 
         if rank == 0:
             centers_converted = centers.to(device=self.codebooks.data.device, dtype=self.codebooks.data.dtype)
@@ -379,12 +413,54 @@ class VQ(nn.Module):
         self.reset_node_count()
 
     @torch.no_grad()
+    def _update_recent_nodes(self, nodes_code: Tensor) -> None:
+        nodes = nodes_code.detach().reshape(-1, self.code_dim)
+        if nodes.numel() == 0:
+            return
+
+        capacity = self.usage_reservoir_size
+        if nodes.shape[0] >= capacity:
+            selected = torch.randperm(nodes.shape[0], device=nodes.device)[:capacity]
+            self._recent_nodes.copy_(nodes[selected])
+            self._recent_nodes_count.fill_(capacity)
+            self._recent_nodes_cursor.zero_()
+            return
+
+        cursor = int(self._recent_nodes_cursor.item())
+        first_count = min(nodes.shape[0], capacity - cursor)
+        self._recent_nodes[cursor : cursor + first_count].copy_(nodes[:first_count])
+        remaining = nodes.shape[0] - first_count
+        if remaining > 0:
+            self._recent_nodes[:remaining].copy_(nodes[first_count:])
+        self._recent_nodes_cursor.fill_((cursor + nodes.shape[0]) % capacity)
+        self._recent_nodes_count.fill_(
+            min(capacity, int(self._recent_nodes_count.item()) + nodes.shape[0])
+        )
+
+    @torch.no_grad()
     def _maybe_data_dependent_init(self, nodes_code: Tensor) -> None:
-        if not self.data_dependent_init:
+        self._update_recent_nodes(nodes_code)
+        if not self.data_dependent_init or bool(self.initialized.item()):
             return
-        if bool(self.initialized.item()):
+
+        nodes = nodes_code.detach().reshape(-1, self.code_dim)
+        current_count = int(self._kmeans_init_count.item())
+        remaining = self.kmeans_min_samples - current_count
+        if remaining > 0 and nodes.shape[0] > 0:
+            if nodes.shape[0] > remaining:
+                selected = torch.randperm(nodes.shape[0], device=nodes.device)[:remaining]
+                nodes = nodes[selected]
+            else:
+                nodes = nodes[:remaining]
+            next_count = current_count + nodes.shape[0]
+            self._kmeans_init_buffer[current_count:next_count].copy_(nodes)
+            self._kmeans_init_count.fill_(next_count)
+
+        if int(self._kmeans_init_count.item()) < self.kmeans_min_samples:
             return
-        self.kmeans_init(nodes_code)
+
+        self.kmeans_init(self._kmeans_init_buffer[: self.kmeans_min_samples])
+        self._kmeans_init_count.zero_()
 
     def entropy_loss(
         self,
@@ -454,6 +530,24 @@ class VQ(nn.Module):
 
         self.last_avg_unique_codes = avg_unique
         return avg_unique
+    @torch.no_grad()
+    def _update_usage_metrics(self) -> None:
+        counts = self.node_count.float()
+        total = counts.sum()
+        if total.item() == 0:
+            zero = counts.new_tensor(0.0)
+            self.last_active_code_count = zero
+            self.last_dominant_code_fraction = zero
+            self.last_usage_perplexity = zero
+            return
+
+        probabilities = counts / total
+        nonzero = probabilities > 0
+        self.last_active_code_count = nonzero.sum().float()
+        self.last_dominant_code_fraction = probabilities.max()
+        self.last_usage_perplexity = torch.exp(
+            -(probabilities[nonzero] * probabilities[nonzero].log()).sum()
+        )
 
     def orthogonality_loss(self) -> Tensor:
         if self.codebook_size <= 1:
@@ -465,6 +559,19 @@ class VQ(nn.Module):
         loss = (off_diag.pow(2).sum() - torch.diagonal(off_diag).pow(2).sum()) / (self.codebook_size * (self.codebook_size - 1))
         return loss.clamp_min(0.0)
 
+
+    def _select_code_indices(
+        self,
+        distances: Tensor,
+        soft_weights: Optional[Tensor],
+    ) -> Tensor:
+        if self.training and self.stochastic_assignment:
+            if soft_weights is None:
+                raise RuntimeError("Soft weights are required for stochastic assignment")
+            flat_weights = soft_weights.reshape(-1, self.codebook_size)
+            sampled = torch.multinomial(flat_weights, num_samples=1)
+            return sampled.reshape(distances.shape[:-1])
+        return torch.argmin(distances, dim=-1)
 
     def forward(self, nodes: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         nodes_proj = self.in_norm(nodes)
@@ -483,9 +590,10 @@ class VQ(nn.Module):
             soft_weights = soft_weights.clamp(min=self.eps, max=1.0)
             quantized_soft = torch.matmul(soft_weights.view(-1, self.codebook_size), code_used).view(*distances.shape[:-1], self.code_dim)
         else:
+            soft_weights = None
             quantized_soft = None
 
-        min_indices = torch.argmin(distances, dim=-1)
+        min_indices = self._select_code_indices(distances, soft_weights)
         hard_quantized = F.embedding(min_indices, code_used)
         self._update_slot_redundancy_metrics(min_indices)
 
@@ -513,6 +621,7 @@ class VQ(nn.Module):
         entropy_temp = temperature if (self.use_temperature_schedule or self.use_soft_assignment) else None
         entropy_loss = self.entropy_loss(-distances, temperature=entropy_temp)
         self.node_count.index_add_(0, min_indices.reshape(-1), torch.ones_like(min_indices.reshape(-1), dtype=self.node_count.dtype))
+        self._update_usage_metrics()
         self.compute_inter_code_stats()
 
         quantized_out = quantized
@@ -578,9 +687,7 @@ class VQ(nn.Module):
         if not bool(self.initialized.item()):
             return 0, torch.empty(0, device=self.codebooks.device, dtype=torch.long)
 
-        # std = self.codebooks.data.std()
-        # eps_noise = 0.01 * torch.clamp(std, min=1e-5)
-        eps_noise = 1e-10
+        eps_noise = 1e-3
 
         ddp_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
         if ddp_initialized:
@@ -644,11 +751,22 @@ class VQ(nn.Module):
                     _, sort_idx = torch.sort(unused_counts, descending=False)
                     unused_indices = unused_indices[sort_idx[:num_replaced]]
 
-                    sampled_indices = torch.multinomial(probs, num_replaced, replacement=True)
-                    sampled_used_indices = used_indices[sampled_indices]
-                    replacements = self.codebooks.data[sampled_used_indices]
-                    noise = eps_noise * torch.randn_like(replacements)
-                    self.codebooks.data[unused_indices] = replacements + noise
+                    recent_count = int(self._recent_nodes_count.item())
+                    if recent_count > 0:
+                        sampled_recent_indices = torch.randint(
+                            recent_count,
+                            (num_replaced,),
+                            device=self.codebooks.device,
+                        )
+                        replacements = self._recent_nodes[sampled_recent_indices]
+                    else:
+                        sampled_indices = torch.multinomial(probs, num_replaced, replacement=True)
+                        sampled_used_indices = used_indices[sampled_indices]
+                        replacements = self.codebooks.data[sampled_used_indices]
+                    replacements = replacements + eps_noise * torch.randn_like(replacements)
+                    if self.use_cosine_sim:
+                        replacements = F.normalize(replacements, dim=-1, eps=self.eps)
+                    self.codebooks.data[unused_indices] = replacements
                     print("=" * 50)
                     print(
                         "Replaced {} unused codebooks (found {}, cap: {}) using importance sampling based on node_count".format(
@@ -842,9 +960,10 @@ class EMAVQ(VQ):
             soft_weights = soft_weights.clamp(min=self.eps, max=1.0)
             quantized_soft = torch.matmul(soft_weights.view(-1, self.codebook_size), code_used).view(*distances.shape[:-1], self.code_dim)
         else:
+            soft_weights = None
             quantized_soft = None
 
-        min_indices = torch.argmin(distances, dim=-1)
+        min_indices = self._select_code_indices(distances, soft_weights)
         hard_quantized = F.embedding(min_indices, code_used)
 
         # Metrics
@@ -868,6 +987,7 @@ class EMAVQ(VQ):
         entropy_temp = temperature if (self.use_temperature_schedule or self.use_soft_assignment) else None
         entropy_loss = self.entropy_loss(-distances, temperature=entropy_temp)
         self.node_count.index_add_(0, min_indices.reshape(-1), torch.ones_like(min_indices.reshape(-1), dtype=self.node_count.dtype))
+        self._update_usage_metrics()
         self.compute_inter_code_stats()
 
         quantized_out = quantized
@@ -924,6 +1044,7 @@ class NSVQ(VQ):
 
         perplexity = self._compute_batch_perplexity(min_indices)
         self.node_count.index_add_(0, min_indices.reshape(-1), torch.ones_like(min_indices.reshape(-1), dtype=self.node_count.dtype))
+        self._update_usage_metrics()
         entropy_loss = self.entropy_loss(-distances)
         if self.orthogonal_loss_weight > 0:
             orth_loss = self.orthogonality_loss()

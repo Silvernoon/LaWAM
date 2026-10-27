@@ -25,6 +25,8 @@ class LatentWorldPolicyInferBatchBuilder:
         "state",
         "state_mask",
         "wrist_image",
+        "camera_rays",
+        "camera_poses",
     }
     _REQUIRED_INFER_KEYS = {"lang", "primary_image", "action_hz", "embodiment_id"}
 
@@ -41,6 +43,10 @@ class LatentWorldPolicyInferBatchBuilder:
         self.policy_vlm_adapter = policy_vlm_adapter
         self.infer_image_hw = self.DEFAULT_INFER_IMAGE_HW
         self.enable_primary_random_resized_crop = bool(enable_primary_random_resized_crop)
+        self.stereo_num_views = int(getattr(policy_cfg, "stereo_num_views", 1))
+        self.stereo_include_wrist_views = bool(getattr(policy_cfg, "stereo_include_wrist_views", False))
+        if self.stereo_num_views < 1:
+            raise ValueError(f"stereo_num_views must be >= 1, got {self.stereo_num_views}.")
 
     def _target_device(self) -> torch.device:
         return next(self.policy_backend.parameters()).device
@@ -52,17 +58,61 @@ class LatentWorldPolicyInferBatchBuilder:
             moved[key] = value.to(device=device, non_blocking=True) if torch.is_tensor(value) else value
         return batch.__class__(moved)
 
+    def _select_stereo_images(
+        self,
+        primary_frames: list[torch.Tensor],
+        wrist_frames: list[torch.Tensor],
+        *,
+        ex_idx: int,
+    ) -> torch.Tensor:
+        views = list(primary_frames)
+        if self.stereo_include_wrist_views:
+            views.extend(wrist_frames)
+        if len(views) < self.stereo_num_views:
+            raise ValueError(
+                f"inference examples[{ex_idx}] requires {self.stereo_num_views} stereo views, "
+                f"but only {len(views)} are available (primary={len(primary_frames)}, wrist={len(wrist_frames)}, "
+                f"include_wrist={self.stereo_include_wrist_views})."
+            )
+        return torch.stack(views[: self.stereo_num_views], dim=0).contiguous()
+    @staticmethod
+    def _normalize_camera_rays(value, *, ex_idx: int) -> torch.Tensor:
+        rays = torch.as_tensor(value, dtype=torch.float32)
+        if rays.ndim == 4:
+            rays = rays.unsqueeze(0)
+        if rays.ndim != 5 or int(rays.shape[0]) != 1 or int(rays.shape[-1]) != 3:
+            raise ValueError(
+                f"examples[{ex_idx}]['camera_rays'] must be [V,H,W,3] or [1,V,H,W,3], "
+                f"got {tuple(rays.shape)}."
+            )
+        return rays.contiguous()
+
+    @staticmethod
+    def _normalize_camera_poses(value, *, ex_idx: int) -> torch.Tensor:
+        poses = torch.as_tensor(value, dtype=torch.float32)
+        if poses.ndim == 2:
+            poses = poses.unsqueeze(0)
+        if poses.ndim != 3 or int(poses.shape[0]) != 1:
+            raise ValueError(
+                f"examples[{ex_idx}]['camera_poses'] must be [V,P] or [1,V,P], got {tuple(poses.shape)}."
+            )
+        return poses.contiguous()
+
     def build_infer_batch(self, examples: Sequence[LatentWorldPolicyInferExample]) -> LatentWorldPolicyInferBatch:
         state_dim = int(self.policy_cfg.flow_cfg.state_dim)
 
         image_views_batch: list[list[Image.Image]] = []
         wrist_image_views_batch: list[list[Image.Image]] = []
-        primary_image_tensors: list[torch.Tensor] = []
+        stereo_image_tensors: list[torch.Tensor] = []
         instructions: list[str] = []
         state_tensors: list[torch.Tensor] = []
         state_masks: list[torch.Tensor] = []
         embodiment_ids: list[int] = []
         action_hz_list: list[float] = []
+        camera_rays_list: list[torch.Tensor] = []
+        camera_poses_list: list[torch.Tensor] = []
+        camera_rays_present: bool | None = None
+        camera_poses_present: bool | None = None
 
         for ex_idx, ex in enumerate(examples):
             extra_keys = sorted(set(ex.keys()) - self._ALLOWED_INFER_KEYS)
@@ -125,6 +175,21 @@ class LatentWorldPolicyInferBatchBuilder:
                 state_tensors.append(torch.zeros((state_dim,), dtype=torch.float32))
                 state_masks.append(torch.zeros((state_dim,), dtype=torch.bool))
 
+            sample_has_rays = "camera_rays" in ex
+            sample_has_poses = "camera_poses" in ex
+            if camera_rays_present is None:
+                camera_rays_present = sample_has_rays
+            elif camera_rays_present != sample_has_rays:
+                raise ValueError("camera_rays must be present for every inference example or none of them.")
+            if camera_poses_present is None:
+                camera_poses_present = sample_has_poses
+            elif camera_poses_present != sample_has_poses:
+                raise ValueError("camera_poses must be present for every inference example or none of them.")
+            if sample_has_rays:
+                camera_rays_list.append(self._normalize_camera_rays(ex["camera_rays"], ex_idx=ex_idx))
+            if sample_has_poses:
+                camera_poses_list.append(self._normalize_camera_poses(ex["camera_poses"], ex_idx=ex_idx))
+
             processed_primary_frames_uint8 = [
                 prepare_frame_spatial_uint8(
                     primary_frame,
@@ -133,15 +198,16 @@ class LatentWorldPolicyInferBatchBuilder:
                 )
                 for primary_frame in primary_frames
             ]
-            processed_wrist_pils = [
-                self._chw_uint8_to_pil(
-                    prepare_frame_spatial_uint8(
-                        wrist_frame,
-                        target_hw=self.infer_image_hw,
-                        apply_center_crop_90=self.enable_primary_random_resized_crop,
-                    )
+            processed_wrist_frames_uint8 = [
+                prepare_frame_spatial_uint8(
+                    wrist_frame,
+                    target_hw=self.infer_image_hw,
+                    apply_center_crop_90=self.enable_primary_random_resized_crop,
                 )
                 for wrist_frame in wrist_frames
+            ]
+            processed_wrist_pils = [
+                self._chw_uint8_to_pil(wrist_frame) for wrist_frame in processed_wrist_frames_uint8
             ]
 
             image_views_batch.append([
@@ -149,7 +215,13 @@ class LatentWorldPolicyInferBatchBuilder:
                 for processed_primary_frame_uint8 in processed_primary_frames_uint8
             ])
             wrist_image_views_batch.append(processed_wrist_pils)
-            primary_image_tensors.append(processed_primary_frames_uint8[0].to(dtype=torch.float32).div_(255.0))
+            stereo_image_tensors.append(
+                self._select_stereo_images(
+                    processed_primary_frames_uint8,
+                    processed_wrist_frames_uint8,
+                    ex_idx=ex_idx,
+                ).to(dtype=torch.float32).div_(255.0)
+            )
             instructions.append(instruction)
             embodiment_ids.append(embodiment_id)
             action_hz_list.append(action_hz)
@@ -168,8 +240,16 @@ class LatentWorldPolicyInferBatchBuilder:
             placeholder_id=int(self.policy_backend.placeholder_token_id),
         )
 
-        primary_image_batch = torch.stack(primary_image_tensors, dim=0)
-        imagenet_normalize_image_batch_(primary_image_batch)
+        stereo_image_batch = torch.stack(stereo_image_tensors, dim=0)
+        batch_size, num_views = stereo_image_batch.shape[:2]
+        flat_stereo_image_batch = stereo_image_batch.reshape(
+            batch_size * num_views, *stereo_image_batch.shape[2:]
+        )
+        imagenet_normalize_image_batch_(flat_stereo_image_batch)
+        if self.stereo_num_views == 1:
+            stereo_image_batch = stereo_image_batch[:, 0]
+        else:
+            stereo_image_batch = stereo_image_batch.unsqueeze(2)
 
         batch: LatentWorldPolicyInferBatch = {
             "pixel_values": qwen_inputs["pixel_values"],
@@ -177,7 +257,7 @@ class LatentWorldPolicyInferBatchBuilder:
             "attention_mask": qwen_inputs["attention_mask"],
             "act_placeholder_mask": act_mask,
             "flow_placeholder_mask": flow_mask,
-            "primary_image": primary_image_batch,
+            "stereo_image": stereo_image_batch,
             "state": torch.stack(state_tensors, dim=0),
             "state_mask": torch.stack(state_masks, dim=0),
             "embodiment_id": torch.tensor(embodiment_ids, dtype=torch.long),
@@ -186,6 +266,15 @@ class LatentWorldPolicyInferBatchBuilder:
         }
         if not torch.is_tensor(batch["image_grid_thw"]):
             batch["image_grid_thw"] = None
+        if camera_rays_present:
+            if self.enable_primary_random_resized_crop:
+                raise ValueError(
+                    "camera_rays cannot be used with inference image crop unless the geometry is "
+                    "transformed with the same operation."
+                )
+            batch["camera_rays"] = torch.stack(camera_rays_list, dim=0)
+        if camera_poses_present:
+            batch["camera_poses"] = torch.stack(camera_poses_list, dim=0)
         return self._move_batch_to_device(batch, self._target_device())
 
     @staticmethod

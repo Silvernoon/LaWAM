@@ -44,12 +44,16 @@ class LatentLAMModel(nn.Module):
         num_embodiments: int = 32,
         image_hw: Tuple[int, int] = LAM_IMAGE_HW,
         patch_size: int = LAM_PATCH_SIZE,
+        num_views: int = 1,
         decoder_last_ln: bool = True,
         **kwargs
     ):
         super().__init__()
         self.image_hw = (int(image_hw[0]), int(image_hw[1]))
         self.patch_size = int(patch_size)
+        self.num_views = int(num_views)
+        if self.num_views < 1:
+            raise ValueError(f"num_views must be >= 1, got {self.num_views}.")
         if self.patch_size not in (8, 16):
             raise ValueError(
                 f"Unsupported patch_size={self.patch_size}. Only 8 or 16 are supported "
@@ -60,7 +64,7 @@ class LatentLAMModel(nn.Module):
                 f"image_hw={self.image_hw} must be divisible by patch_size={self.patch_size}."
             )
         self.grid_height = self.image_hw[0] // self.patch_size
-        self.grid_width = self.image_hw[1] // self.patch_size
+        self.grid_width = (self.image_hw[1] // self.patch_size) * self.num_views
         # Allocate one normalization layer per requested latent layer.
         if isinstance(latent_layer_to_use, (list, tuple)):
             num_latent_layers = len(latent_layer_to_use)
@@ -71,6 +75,8 @@ class LatentLAMModel(nn.Module):
             num_latent_layers=num_latent_layers,
             norm_layer_type=norm_latents_type,
             enable_norm=norm_latents,
+            num_views=self.num_views,
+            image_hw=self.image_hw,
         )
         self.feature_dim = dim
         self.code_dim = code_dim
@@ -103,6 +109,16 @@ class LatentLAMModel(nn.Module):
                         f"compression ratio ({int(getattr(self.vision_encoder, 'patch_size', 8))}). "
                         "Set model.patch_size accordingly (e.g. 8)."
                     )
+                if self.num_views != int(getattr(self.vision_encoder, "num_views", self.num_views)):
+                    raise ValueError(
+                        "WorldStereoVAEEncoder num_views does not match the LAM stereo layout: "
+                        f"encoder={getattr(self.vision_encoder, 'num_views', None)}, LAM={self.num_views}."
+                    )
+            elif self.num_views != 1:
+                raise ValueError(
+                    f"num_views={self.num_views} is supported only by WorldStereoVAEEncoder; "
+                    f"got {type(self.vision_encoder).__name__}."
+                )
             encoder_image_size = getattr(self.vision_encoder, "image_size", None)
             if encoder_image_size is not None:
                 expected_hw = (int(encoder_image_size), int(encoder_image_size))
@@ -211,6 +227,29 @@ class LatentLAMModel(nn.Module):
 
     def _uses_vjepa_split_features(self) -> bool:
         return self.train_in_latent and isinstance(self.vision_encoder, VJEPAEncoder)
+    @staticmethod
+    def _video_time_dim(videos: torch.Tensor) -> int:
+        if videos.ndim == 6:
+            return 2
+        if videos.ndim == 5:
+            return 1
+        raise ValueError(
+            "LAM videos must be [B,T,C,H,W] or stereo [B,V,T,C,H,W], "
+            f"got {tuple(videos.shape)}."
+        )
+
+    @classmethod
+    def _video_time_length(cls, videos: torch.Tensor) -> int:
+        return int(videos.shape[cls._video_time_dim(videos)])
+
+    @classmethod
+    def _concat_video_time(cls, first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+        if first.ndim != second.ndim:
+            raise ValueError(
+                f"Cannot concatenate videos with different ranks: {tuple(first.shape)} vs {tuple(second.shape)}."
+            )
+        return torch.cat([first, second], dim=cls._video_time_dim(first))
+
     def _resolve_states(
         self,
         *,
@@ -228,7 +267,7 @@ class LatentLAMModel(nn.Module):
                 raise ValueError("[LatentLAMModel] `states` is required for training/inference.")
             if videos.ndim < 2:
                 raise ValueError(f"[LatentLAMModel] invalid videos shape: {tuple(videos.shape)}")
-            fallback_t = int(videos.shape[1])
+            fallback_t = self._video_time_length(videos)
             if fallback_t <= 0:
                 raise ValueError("[LatentLAMModel] videos must have positive temporal length.")
             state_dtype = videos.dtype if torch.is_floating_point(videos) else torch.float32
@@ -366,7 +405,7 @@ class LatentLAMModel(nn.Module):
         else:
             states_for_model = states
 
-        T = videos.shape[1]
+        T = self._video_time_length(videos)
         
         if self.train_in_latent:
             if self._uses_vjepa_split_features():
@@ -385,7 +424,7 @@ class LatentLAMModel(nn.Module):
                 tgt = dec_feats[:, -1:]
                 dec_states = states_for_model[:, :1]
             else:
-                cat_videos = torch.cat([videos, dec_videos], dim=1)
+                cat_videos = self._concat_video_time(videos, dec_videos)
                 all_features = self.vision_encoder.encode(
                     cat_videos,
                     n=self.latent_layer_to_use,
@@ -413,7 +452,7 @@ class LatentLAMModel(nn.Module):
             else:
                 vision_features = torch.stack([dec_in, tgt], dim=1)
         else:
-            cat_videos = torch.cat([videos, dec_videos], dim=1)
+            cat_videos = self._concat_video_time(videos, dec_videos)
             patches = self.vision_encoder.encode(cat_videos)
             enc_in = patches[:, :T]  # [B, T, K, D]
             dec_in = patches[:, T : T + 1]  # [B, 1, K, D]

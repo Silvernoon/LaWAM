@@ -37,6 +37,8 @@ class LeRobotDataModule(LightningDataModule):
         preferred_video_key: Optional[str] = None,
         state_keys: Optional[list[str]] = None,
         image_hw: tuple[int, int] = LAM_IMAGE_HW,
+        num_views: int = 1,
+        include_wrist_views: bool = False,
         *,
         # Physical-time sampling interval in seconds (required).
         frame_dt_sec: float,
@@ -70,6 +72,8 @@ class LeRobotDataModule(LightningDataModule):
         self.preferred_video_key = preferred_video_key
         self.state_keys = state_keys
         self.image_hw = (int(image_hw[0]), int(image_hw[1]))
+        self.num_views = int(num_views)
+        self.include_wrist_views = bool(include_wrist_views)
         self.frame_dt_sec = frame_dt_sec
         self.human_frame_dt_sec = human_frame_dt_sec
         self.batch_size = batch_size
@@ -97,6 +101,8 @@ class LeRobotDataModule(LightningDataModule):
                 preferred_video_key=self.preferred_video_key,
                 state_keys=self.state_keys,
                 image_hw=self.image_hw,
+                num_views=self.num_views,
+                include_wrist_views=self.include_wrist_views,
                 frame_dt_sec=self.frame_dt_sec,
                 human_frame_dt_sec=self.human_frame_dt_sec,
                 debug_repeat_batch=self.debug_repeat_batch,
@@ -113,6 +119,8 @@ class LeRobotDataModule(LightningDataModule):
                     preferred_video_key=self.preferred_video_key,
                     state_keys=self.state_keys,
                     image_hw=self.image_hw,
+                    num_views=self.num_views,
+                    include_wrist_views=self.include_wrist_views,
                     frame_dt_sec=self.frame_dt_sec,
                     human_frame_dt_sec=self.human_frame_dt_sec,
                     debug_repeat_batch=False,
